@@ -96,6 +96,8 @@
 - `uiEntries` 每条必须同时有 `id`、`title`、`slot`；`page` 与 `handler` 只能二选一，`page` 必须是包内相对路径且以 `.html` / `.htm` 结尾；每个插件最多 2 条；条目里出现未知字段会导致清单解析失败。清单解析失败时插件仍在列表里，但状态是错误、开关不可用——排查时先看详情页给出的字段名。
 - 打包成 zip 后导入。包内路径不得越界（`..`、绝对路径），不要包含 `.so`、`.dex`、`.apk`、`.jar`、`.wasm` 等可执行文件，否则安装与商店审计都会拒绝。
 - 只声明 `tools` 的插件属于无界面插件：AI 能调用它的工具，界面上不会多出任何入口，这是正常行为。
+- `agent.request.started/finished` 与 `agent.run.started/finished` 观察事件通过 `runId` 关联；请求完成可能早于整轮结束，续接前用 `host.chat.getRunState` 等待空闲。会话轮数上限以 `errorCode: conversation_turn_limit` 表示，仅在失败状态处理；`cancelled` 不应触发续接。观察事件不携带原始错误正文。
+- `host.chat.createSession` 可显式继承 `providerId`、`model`、`reasoningEffort`；`providerId` 与 `model` 必须成对提供。发送消息由聊天页消费请求队列并走普通工具授权流程，聊天页未就绪时会拒绝。
 
 ### 发布到商店
 - 用户点插件页顶栏的上传图标 →「选择插件包」即完成提交：App 把包以 base64 写入暂存仓库（`yyds0399/Muse-Plugins-Inbox`）的 `incoming/` 目录，商店仓库的定时任务审计通过后自动并入索引，约 15 分钟可见；包上限 20MB。

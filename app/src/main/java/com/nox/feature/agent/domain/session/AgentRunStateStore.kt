@@ -19,7 +19,8 @@ data class AgentRunSnapshot(
     val status: String,
     val error: String? = null,
     val startedAt: Long? = null,
-    val finishedAt: Long? = null
+    val finishedAt: Long? = null,
+    val runId: String? = null
 )
 
 /** 运行状态变化事件；页面桥据此推送 chat.run.started / chat.run.finished。 */
@@ -54,29 +55,36 @@ class AgentRunStateStore @Inject constructor() {
     private val _events = MutableSharedFlow<AgentRunEvent>(extraBufferCapacity = 64)
     val events: SharedFlow<AgentRunEvent> = _events.asSharedFlow()
 
-    fun started(sessionId: String) {
+    @Synchronized
+    fun started(sessionId: String, runId: String? = null) {
         val now = System.currentTimeMillis()
         _states.value = _states.value + (sessionId to AgentRunSnapshot(
             sessionId = sessionId,
             running = true,
             status = "running",
-            startedAt = now
+            startedAt = now,
+            runId = runId
         ))
         _events.tryEmit(AgentRunEvent.Started(sessionId, now))
     }
 
-    fun finished(sessionId: String, status: String, error: String?) {
+    /** 结束一轮；[runId] 不匹配当前轮时忽略。返回是否真的写入终态。 */
+    @Synchronized
+    fun finished(sessionId: String, status: String, error: String?, runId: String? = null): Boolean {
         val now = System.currentTimeMillis()
         val previous = _states.value[sessionId]
+        if (runId != null && previous?.runId != runId) return false
         _states.value = _states.value + (sessionId to AgentRunSnapshot(
             sessionId = sessionId,
             running = false,
             status = status,
             error = error,
             startedAt = previous?.startedAt,
-            finishedAt = now
+            finishedAt = now,
+            runId = previous?.runId
         ))
         _events.tryEmit(AgentRunEvent.Finished(sessionId, status, error, now))
+        return true
     }
 
     fun snapshot(sessionId: String): AgentRunSnapshot? = _states.value[sessionId]

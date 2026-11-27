@@ -30,6 +30,7 @@ import com.nox.feature.plugin.domain.PluginHostPaths
 import com.nox.feature.plugin.domain.PluginManager
 import com.nox.feature.settings.data.repository.DefaultModelSettingsRepository
 import com.nox.feature.settings.data.repository.ModelReasoningEffortRepository
+import com.nox.feature.settings.domain.repository.AIProviderRepository
 import com.nox.feature.workspace.data.repository.WorkspaceRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
@@ -64,6 +65,7 @@ class PluginChatService @Inject constructor(
     private val agentMessageDao: AgentMessageDao,
     private val defaultModelSettingsRepository: DefaultModelSettingsRepository,
     private val modelReasoningEffortRepository: ModelReasoningEffortRepository,
+    private val providerRepository: AIProviderRepository,
     private val requestBus: AgentChatRequestBus,
     private val runStateStore: AgentRunStateStore,
     private val toolPermissionManager: ToolPermissionManager,
@@ -94,9 +96,40 @@ class PluginChatService @Inject constructor(
             ?.also { if (it.length > MAX_TITLE_CHARS) throw paramInvalid("title too long") }
             ?: context.getString(R.string.chat_new_session_btn)
         val mode = parseMode(params["mode"])
-        val providerId = defaultModelSettingsRepository.getDefaultProviderId().takeIf { it.isNotBlank() }
-        val model = defaultModelSettingsRepository.getDefaultModel().takeIf { it.isNotBlank() }
-        val effort = if (providerId != null && model != null) {
+        val requestedProviderId = optionalNonBlankString(params, "providerId")
+        val requestedModel = optionalNonBlankString(params, "model")
+        if ((requestedProviderId == null) != (requestedModel == null)) {
+            throw paramInvalid("providerId and model must be provided together")
+        }
+        val requestedEffort = optionalNonBlankString(params, "reasoningEffort")?.let { raw ->
+            ReasoningEffort.entries.firstOrNull { it.name.equals(raw, ignoreCase = true) }?.name
+                ?: throw paramInvalid("unknown reasoningEffort")
+        }
+        if (requestedProviderId != null && requestedModel != null) {
+            val config = providerRepository.getProviderById(requestedProviderId)
+                ?: throw PluginHostException("PROVIDER_NOT_FOUND", "provider not found: $requestedProviderId")
+            if (!config.isEnabled) {
+                throw PluginHostException("PROVIDER_DISABLED", "provider is disabled: ${config.id}")
+            }
+            if (!config.hasUsableApiKey) {
+                throw PluginHostException("PROVIDER_NO_KEY", "provider has no usable key: ${config.id}")
+            }
+            val available = (config.models + listOf(config.defaultModel, config.selectedModel))
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+            if (requestedModel !in available) {
+                throw PluginHostException(
+                    "MODEL_NOT_AVAILABLE",
+                    "model $requestedModel is not in provider ${config.id}"
+                )
+            }
+        }
+        val providerId = requestedProviderId
+            ?: defaultModelSettingsRepository.getDefaultProviderId().takeIf { it.isNotBlank() }
+        val model = requestedModel
+            ?: defaultModelSettingsRepository.getDefaultModel().takeIf { it.isNotBlank() }
+        val effort = requestedEffort ?: if (providerId != null && model != null) {
             modelReasoningEffortRepository.get(providerId, model) ?: ReasoningEffort.MEDIUM.name
         } else {
             ReasoningEffort.MEDIUM.name
@@ -431,7 +464,7 @@ class PluginChatService @Inject constructor(
         }
         put("running", snapshot.running)
         put("status", snapshot.status)
-        snapshot.error?.let { put("error", it) }
+        snapshot.error?.let { put("errorCode", it) }
         snapshot.startedAt?.let { put("startedAt", it) }
         snapshot.finishedAt?.let { put("finishedAt", it) }
     }
@@ -486,6 +519,14 @@ class PluginChatService @Inject constructor(
         val raw = params[key] ?: return null
         return (raw as? JsonPrimitive)?.contentOrNull
             ?: throw paramInvalid("$key must be a string")
+    }
+
+    private fun optionalNonBlankString(params: JsonObject, key: String): String? {
+        val raw = params[key] ?: return null
+        val value = (raw as? JsonPrimitive)?.takeIf { it.isString }?.content?.trim()
+            ?: throw paramInvalid("$key must be a string")
+        if (value.isEmpty()) throw paramInvalid("$key is blank")
+        return value
     }
 
     private fun optionalBoolean(params: JsonObject, key: String): Boolean? {

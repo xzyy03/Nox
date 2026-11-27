@@ -127,7 +127,7 @@ class PluginWebBridge(
                 is AgentRunEvent.Finished -> postEvent("chat.run.finished", buildJsonObject {
                     put("sessionId", event.sessionId)
                     put("status", event.status)
-                    event.error?.let { put("error", it) }
+                    event.error?.let { put("errorCode", it) }
                     put("finishedAt", event.finishedAt)
                 })
             }

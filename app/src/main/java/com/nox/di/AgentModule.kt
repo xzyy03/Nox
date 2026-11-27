@@ -455,6 +455,7 @@ object AgentModule {
         agentNotificationCenter: AgentNotificationCenter,
         eventInjector: AgentEventInjector,
         fileAccess: FileAccessProvider,
+        pluginHookDispatcher: com.nox.feature.plugin.runtime.PluginHookDispatcher,
         @ApplicationContext context: Context
     ): AgentWorkflow {
         return StatefulAgentWorkflow(
@@ -482,6 +483,7 @@ object AgentModule {
             agentNotificationCenter,
             eventInjector,
             fileAccess,
+            pluginHookDispatcher,
             context
         )
     }
