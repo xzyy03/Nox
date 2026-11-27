@@ -425,6 +425,10 @@ my-plugin-1.0.0.zip
 
 observe 事件的 payload 只有运行元数据（会话 id、工具名等），不含消息正文、工具参数或结果。
 
+`agent.run.*` 表示完整的一轮任务，`agent.request.*` 表示其中一次模型请求；两者通过 `runId` 关联，请求另有 `requestId`。完成状态为 `success` / `error` / `cancelled`，轮数上限失败通过 `errorCode: conversation_turn_limit` 标识，不转发原始错误正文。请求完成时任务仍可能在运行，自动续接前应调用 `host.chat.getRunState` 或 `host.chat.waitForRun` 确认空闲；取消不能触发失败续接。
+
+`host.chat.createSession` 可传 `providerId`、`model` 与 `reasoningEffort`，用于继承原会话的模型选择；前两项必须成对提供，供应商需已启用且有可用凭据，模型需在该供应商配置中。省略时沿用默认模型设置。`host.chat.sendMessage` 仍交由聊天页按普通消息流程处理，聊天页尚未就绪时返回 `CHAT_UI_UNAVAILABLE`。
+
 ### hook handler 的返回结构
 
 `observe` 返回什么都行，宿主会忽略。另两种模式返回结构固定，写错不会报错但也不生效。

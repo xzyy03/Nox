@@ -121,6 +121,7 @@ class StatefulAgentWorkflow @Inject constructor(
     private val agentNotificationCenter: AgentNotificationCenter,
     private val eventInjector: AgentEventInjector,
     private val fileAccess: FileAccessProvider,
+    private val pluginHookDispatcher: com.nox.feature.plugin.runtime.PluginHookDispatcher,
     @param:ApplicationContext private val appContext: Context
 ) : AgentWorkflow {
 
@@ -607,9 +608,23 @@ class StatefulAgentWorkflow @Inject constructor(
                         val callStartElapsed = SystemClock.elapsedRealtime()
                         val callStartWall = System.currentTimeMillis()
                         val callKind = "chat"
+                        val requestId = UUID.randomUUID().toString()
                         var callError: String? = null
+                        var callErrorCode: String? = null
+                        var callCancelled = false
                         var callCompleted = false
                         val stream = StreamAccumulator(callStartElapsed) { send(it) }
+                        pluginHookDispatcher.dispatchRequestStarted(
+                            sessionId = currentContext.sessionId,
+                            runId = currentContext.runId,
+                            requestId = requestId,
+                            mode = currentContext.mode.name.lowercase(),
+                            scope = if (currentContext.isSubAgent) "subagent" else "main",
+                            agentName = currentContext.agentDefinition?.name,
+                            messageCount = compactedMessages.size,
+                            toolCount = currentTools.size,
+                            estimatedInputTokens = predictedInput
+                        )
 
                         try {
                             // 发送前按实际模型的视觉能力处理图片（同 execute 路径）。
@@ -677,8 +692,10 @@ class StatefulAgentWorkflow @Inject constructor(
                                 )
                             )
                         } catch (e: CancellationException) {
+                            callCancelled = true
                             throw e
                         } catch (e: Exception) {
+                            callErrorCode = AgentFailureCode.from(e.message, (e as? StreamApiException)?.code)
                             if (!overflowRecoveryAttempted && stream.text.isEmpty() && stream.reasoning.isEmpty() && isContextOverflow(e)) {
                                 overflowRecoveryAttempted = true
                                 val recovery = contextCompactor.compactIfNeeded(state.messages, compactionProvider,
@@ -704,11 +721,31 @@ class StatefulAgentWorkflow @Inject constructor(
                             // 多 Key 的自动切换与重发已在 adapter 内完成（见 AIProvider.keySwitcher）；
                             // 走到这里说明不是 Key 问题、或候选 Key 已全部失败，直接上报原始错误。
                             val errorText = "LLM 调用失败: ${e.message}"
-                            actionQueue.addLast(AgentAction.LlmError(errorText))
+                            actionQueue.addLast(AgentAction.LlmError(errorText, callErrorCode))
                             callError = e.message ?: e.javaClass.simpleName
                         } finally {
                             val durationMillis = (SystemClock.elapsedRealtime() - callStartElapsed).toInt()
                             val usage = stream.finalResponse
+                            pluginHookDispatcher.dispatchRequestFinished(
+                                sessionId = currentContext.sessionId,
+                                runId = currentContext.runId,
+                                requestId = requestId,
+                                mode = currentContext.mode.name.lowercase(),
+                                scope = if (currentContext.isSubAgent) "subagent" else "main",
+                                agentName = currentContext.agentDefinition?.name,
+                                status = when {
+                                    callCancelled -> "cancelled"
+                                    callError != null -> "error"
+                                    callCompleted -> "success"
+                                    else -> "cancelled"
+                                },
+                                inputTokens = usage?.inputTokens ?: 0,
+                                outputTokens = usage?.outputTokens ?: 0,
+                                toolCalls = usage?.toolCalls?.size ?: 0,
+                                durationMs = durationMillis,
+                                stopReason = usage?.stopReason,
+                                errorCode = if (callCancelled) null else callErrorCode
+                            )
                             runCatching {
                                 // 与适配器同源算一次「实际会发什么」：落库后能在统计页分辨
                                 // 「选了但没生效」「被降级」这些静默问题。

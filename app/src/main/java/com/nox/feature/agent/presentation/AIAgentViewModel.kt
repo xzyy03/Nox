@@ -138,11 +138,19 @@ import java.io.OutputStream
 import java.util.Calendar
 import java.util.UUID
 import javax.inject.Inject
+import com.nox.feature.agent.domain.session.AgentChatRequest
+import com.nox.feature.agent.domain.session.AgentChatRequestBus
+import com.nox.feature.agent.domain.session.AgentRunStateStore
+import com.nox.feature.agent.domain.workflow.AgentFailureCode
+import com.nox.feature.plugin.runtime.PluginHookDispatcher
 
 @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
 @HiltViewModel
 class AIAgentViewModel @Inject constructor(
     private val agentWorkflow: AgentWorkflow,
+    private val pluginHookDispatcher: PluginHookDispatcher,
+    private val agentRunStateStore: AgentRunStateStore,
+    private val agentChatRequestBus: AgentChatRequestBus,
     private val toolRegistry: ToolRegistry,
     private val agentMessageDao: AgentMessageDao,
     private val chatSessionDao: ChatSessionDao,
@@ -355,6 +363,10 @@ class AIAgentViewModel @Inject constructor(
 
     fun updateInputDraft(text: String) {
         val id = _currentSessionId.value ?: return
+        updateInputDraftForSession(id, text)
+    }
+
+    private fun updateInputDraftForSession(id: String, text: String) {
         val editor = draftPrefs.edit()
         if (text.isEmpty()) {
             _inputDrafts.value = _inputDrafts.value - id
@@ -1348,6 +1360,24 @@ class AIAgentViewModel @Inject constructor(
     }
 
     init {
+        viewModelScope.launch {
+            val consumerId = UUID.randomUUID().toString()
+            agentChatRequestBus.attach(consumerId)
+            try {
+                while (true) {
+                    val request = agentChatRequestBus.receive()
+                    try {
+                        handlePluginChatRequest(request)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        FileLogger.e(TAG, "Plugin chat request failed", e)
+                    }
+                }
+            } finally {
+                agentChatRequestBus.detach(consumerId)
+            }
+        }
         // 冷启动收尾：上次进程被杀时残留的「执行中」工具回填为「已中断」。在后台执行，不阻塞首屏与会话展示。
         viewModelScope.launch(Dispatchers.IO) {
             sessionUseCase.initColdStartCleanup()
@@ -1778,6 +1808,35 @@ class AIAgentViewModel @Inject constructor(
         )
     }
 
+    private suspend fun handlePluginChatRequest(request: AgentChatRequest) {
+        val sessionId = when (request) {
+            is AgentChatRequest.Send -> request.sessionId
+            is AgentChatRequest.Stop -> request.sessionId
+            is AgentChatRequest.Select -> request.sessionId
+            is AgentChatRequest.SetDraft -> request.sessionId ?: _currentSessionId.value ?: return
+            is AgentChatRequest.Delete -> request.sessionId
+        }
+        val session = sessionUseCase.getSessionById(sessionId) ?: return
+        if (session.workspacePath != _currentWorkspace.value) return
+        when (request) {
+            is AgentChatRequest.Send -> {
+                if (request.workspacePath != session.workspacePath) return
+                enqueueAgentRequest(
+                    request = request.text,
+                    projectRoot = session.workspacePath,
+                    targetSessionId = sessionId
+                )
+            }
+            is AgentChatRequest.Stop -> stopAgentSession(sessionId)
+            is AgentChatRequest.Select -> selectSession(sessionId)
+            is AgentChatRequest.SetDraft -> updateInputDraftForSession(
+                sessionId,
+                if (request.append) _inputDrafts.value[sessionId].orEmpty() + request.text else request.text
+            )
+            is AgentChatRequest.Delete -> deleteSession(sessionId).join()
+        }
+    }
+
     fun enqueueAgentRequest(
         request: String,
         modelRequest: String = request,
@@ -1979,6 +2038,15 @@ class AIAgentViewModel @Inject constructor(
         // 声明在 try 外：catch/finally 需要据此向父会话发失败通知并释放子代理并发名额，
         // 而 try 内的异常可能发生在更早的 buildHistory 阶段。
         val isSubSession = currentSession?.parentId != null
+        val runId = UUID.randomUUID().toString()
+        val runMode = (currentSession?.mode ?: AgentMode.AUTO.name).lowercase()
+        val runScope = if (isSubSession) "subagent" else "main"
+        val runAgentName = currentSession?.subagentType
+        var runStatus = "cancelled"
+        var runErrorCode: String? = null
+        var runToolCalls = 0
+        agentRunStateStore.started(sessionId, runId)
+        pluginHookDispatcher.dispatchRunStarted(sessionId, runId, runMode, runScope, runAgentName)
         var turnSucceeded = false
         // 本轮是否处于 goal 自主循环（用于「打断即暂停」）与本轮是否有活动（用于空回合熔断）。
         var goalActiveAtTurn = false
@@ -2066,7 +2134,9 @@ class AIAgentViewModel @Inject constructor(
                 goalStatus = sessionDomain?.goalStatus,
                 reasoningEffort = sessionDomain?.reasoningEffort?.apiValue,
                 fastMode = sessionDomain?.fastMode ?: false,
-                agentDefinition = agentDefinition
+                agentDefinition = agentDefinition,
+                runId = runId,
+                isSubAgent = isSubSession
             )
 
             val isSub = isSubSession
@@ -2244,6 +2314,7 @@ class AIAgentViewModel @Inject constructor(
                         event.persisted?.complete(Unit)
                     }
                     is AgentEvent.ToolCallStarted -> {
+                        runToolCalls++
                         turnHadActivity = true
                         val msgId = "tool_${event.id}"
                         setStreamingText(sessionId, null)
@@ -2289,6 +2360,8 @@ class AIAgentViewModel @Inject constructor(
                     }
                     is AgentEvent.Failed -> {
                         failed = true
+                        runStatus = "error"
+                        runErrorCode = AgentFailureCode.from(event.error, event.reasonCode)
                         setCompacting(sessionId, false)
                         setAgentState(sessionId, AgentUIState.Error(describeFailure(event)))
                         // 子代理会话失败时通知父会话
@@ -2310,7 +2383,7 @@ class AIAgentViewModel @Inject constructor(
                         setKeySwitchState(sessionId, null)
                         setCompacting(sessionId, false)
                         // 子代理会话完成时通知父会话（异步回调）
-                        if (isSub) {
+                        if (isSub && !failed) {
                             sessionUseCase.getSessionById(sessionId)?.parentId?.let { parentId ->
                                 subAgentEventBus.emit(
                                     SubAgentEvent(
@@ -2324,7 +2397,7 @@ class AIAgentViewModel @Inject constructor(
                         // 仅当 App 不在前台时发 agent 完成通知（避免打扰正在看对话的用户）。
                         val inForeground = ProcessLifecycleOwner.get().lifecycle.currentState
                             .isAtLeast(Lifecycle.State.STARTED)
-                        if (!inForeground && agentSoundSettings.isEnabled()) {
+                        if (!failed && !inForeground && agentSoundSettings.isEnabled()) {
                             showAgentCompletedNotification(modelRequest)
                         }
                     }
@@ -2334,7 +2407,8 @@ class AIAgentViewModel @Inject constructor(
                     }
                 }
             }
-            turnSucceeded = true
+            turnSucceeded = !failed
+            if (!failed) runStatus = "success"
 
             sessionUseCase.touch(sessionId, messagePersistenceUseCase.nextTimestamp())
             // 仅当本 job 仍持有忙状态时才置完成态：并发场景下队列/通知可能已启动新的 job
@@ -2347,6 +2421,8 @@ class AIAgentViewModel @Inject constructor(
             setStreamingText(sessionId, null)
 
         } catch (e: CancellationException) {
+            runStatus = "cancelled"
+            runErrorCode = null
             val cancelledState = _agentStates.value[sessionId]
             val isOwnJob = sessionJobs[sessionId] == coroutineContext[Job]
             FileLogger.d(TAG, "stream cancelled: sid=$sessionId isOwnJob=$isOwnJob state=$cancelledState")
@@ -2364,6 +2440,8 @@ class AIAgentViewModel @Inject constructor(
             }
             throw e
         } catch (e: Exception) {
+             runStatus = "error"
+             runErrorCode = AgentFailureCode.from(e.message)
              FileLogger.e(TAG, "executeAgentRequestStream 失败: request=$request", e)
              setAgentState(sessionId, AgentUIState.Error(e.toUserMessage(context)))
              _completedSessions.value = _completedSessions.value - sessionId
@@ -2392,6 +2470,17 @@ class AIAgentViewModel @Inject constructor(
             if (isOwnJob) {
                 sessionJobs.remove(sessionId)
             }
+            val runFinished = agentRunStateStore.finished(sessionId, runStatus, runErrorCode, runId)
+            if (runFinished) pluginHookDispatcher.dispatchRunFinished(
+                sessionId = sessionId,
+                runId = runId,
+                mode = runMode,
+                scope = runScope,
+                agentName = runAgentName,
+                status = runStatus,
+                toolCalls = runToolCalls,
+                errorCode = runErrorCode
+            )
             _runningTools.value = _runningTools.value - sessionId
             setStreamingText(sessionId, null)
             setStreamingReasoning(sessionId, null)
